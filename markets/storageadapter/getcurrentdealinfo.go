@@ -10,61 +10,37 @@ import (
 	"github.com/filecoin-project/lotus/api"
 	"github.com/filecoin-project/lotus/chain/actors/builtin/market"
 	"github.com/filecoin-project/lotus/chain/types"
+	market2 "github.com/filecoin-project/specs-actors/v2/actors/builtin/market"
 	"github.com/ipfs/go-cid"
 	"golang.org/x/xerrors"
 )
 
 type getCurrentDealInfoAPI interface {
+	ChainGetMessage(ctx context.Context, mc cid.Cid) (*types.Message, error)
 	StateLookupID(context.Context, address.Address, types.TipSetKey) (address.Address, error)
 	StateMarketStorageDeal(context.Context, abi.DealID, types.TipSetKey) (*api.MarketDeal, error)
 	StateSearchMsg(context.Context, cid.Cid) (*api.MsgLookup, error)
 }
 
-// GetCurrentDealInfo gets current information on a deal, and corrects the deal ID as needed
-func GetCurrentDealInfo(ctx context.Context, ts *types.TipSet, api getCurrentDealInfoAPI, dealID abi.DealID, proposal market.DealProposal, publishCid *cid.Cid) (abi.DealID, *api.MarketDeal, error) {
-	marketDeal, dealErr := api.StateMarketStorageDeal(ctx, dealID, ts.Key())
-	if dealErr == nil {
-		equal, err := checkDealEquality(ctx, ts, api, proposal, marketDeal.Proposal)
-		if err != nil {
-			return dealID, nil, err
-		}
-		if equal {
-			return dealID, marketDeal, nil
-		}
-		dealErr = xerrors.Errorf("Deal proposals did not match")
-	}
+// GetCurrentDealInfo gets the current deal state and deal ID.
+// Note that the deal ID is assigned when the deal is published, so it may
+// have changed if there was a reorg after the deal was published.
+func GetCurrentDealInfo(ctx context.Context, ts *types.TipSet, api getCurrentDealInfoAPI, proposal market.DealProposal, publishCid *cid.Cid) (abi.DealID, *api.MarketDeal, error) {
 	if publishCid == nil {
-		return dealID, nil, dealErr
+		return abi.DealID(0), nil, xerrors.Errorf("could not get deal info for nil publish deals CID")
 	}
-	// attempt deal id correction
-	lookup, err := api.StateSearchMsg(ctx, *publishCid)
+
+	// Lookup the deal ID by comparing the deal proposal to the proposals in
+	// the publish deals message, and indexing into the message return value
+	dealID, err := dealIDFromPublishDealsMsg(ctx, ts, api, proposal, *publishCid)
 	if err != nil {
 		return dealID, nil, err
 	}
 
-	if lookup.Receipt.ExitCode != exitcode.Ok {
-		return dealID, nil, xerrors.Errorf("looking for publish deal message %s: non-ok exit code: %s", *publishCid, lookup.Receipt.ExitCode)
-	}
-
-	var retval market.PublishStorageDealsReturn
-	if err := retval.UnmarshalCBOR(bytes.NewReader(lookup.Receipt.Return)); err != nil {
-		return dealID, nil, xerrors.Errorf("looking for publish deal message: unmarshaling message return: %w", err)
-	}
-
-	if len(retval.IDs) != 1 {
-		// market currently only ever sends messages with 1 deal
-		return dealID, nil, xerrors.Errorf("can't recover dealIDs from publish deal message with more than 1 deal")
-	}
-
-	if retval.IDs[0] == dealID {
-		// DealID did not change, so we are stuck with the original lookup error
-		return dealID, nil, dealErr
-	}
-
-	dealID = retval.IDs[0]
-	marketDeal, err = api.StateMarketStorageDeal(ctx, dealID, ts.Key())
-
+	// Lookup the deal state by deal ID
+	marketDeal, err := api.StateMarketStorageDeal(ctx, dealID, ts.Key())
 	if err == nil {
+		// Make sure the retrieved deal proposal matches the target proposal
 		equal, err := checkDealEquality(ctx, ts, api, proposal, marketDeal.Proposal)
 		if err != nil {
 			return dealID, nil, err
@@ -74,6 +50,64 @@ func GetCurrentDealInfo(ctx context.Context, ts *types.TipSet, api getCurrentDea
 		}
 	}
 	return dealID, marketDeal, err
+}
+
+// findDealID looks up the publish deals message by cid, and finds the deal ID
+// by looking at the message return value
+func dealIDFromPublishDealsMsg(ctx context.Context, ts *types.TipSet, api getCurrentDealInfoAPI, proposal market.DealProposal, publishCid cid.Cid) (abi.DealID, error) {
+	dealID := abi.DealID(0)
+
+	// Get the return value of the publish deals message
+	lookup, err := api.StateSearchMsg(ctx, publishCid)
+	if err != nil {
+		return dealID, xerrors.Errorf("looking for publish deal message %s: search msg failed: %w", publishCid, err)
+	}
+
+	if lookup.Receipt.ExitCode != exitcode.Ok {
+		return dealID, xerrors.Errorf("looking for publish deal message %s: non-ok exit code: %s", publishCid, lookup.Receipt.ExitCode)
+	}
+
+	var retval market.PublishStorageDealsReturn
+	if err := retval.UnmarshalCBOR(bytes.NewReader(lookup.Receipt.Return)); err != nil {
+		return dealID, xerrors.Errorf("looking for publish deal message %s: unmarshalling message return: %w", publishCid, err)
+	}
+
+	// Get the parameters to the publish deals message
+	publishCid = lookup.Message
+	pubmsg, err := api.ChainGetMessage(ctx, publishCid)
+	if err != nil {
+		return dealID, xerrors.Errorf("getting publish deal message %s: %w", publishCid, err)
+	}
+
+	var pubDealsParams market2.PublishStorageDealsParams
+	if err := pubDealsParams.UnmarshalCBOR(bytes.NewReader(pubmsg.Params)); err != nil {
+		return dealID, xerrors.Errorf("unmarshalling publish deal message params for message %s: %w", publishCid, err)
+	}
+
+	// Scan through the deal proposals in the message parameters to find the
+	// index of the target deal proposal
+	dealIdx := -1
+	for i, paramDeal := range pubDealsParams.Deals {
+		eq, err := checkDealEquality(ctx, ts, api, proposal, market.DealProposal(paramDeal.Proposal))
+		if err != nil {
+			return dealID, xerrors.Errorf("comparing publish deal message %s proposal to deal proposal: %w", publishCid, err)
+		}
+		if eq {
+			dealIdx = i
+			break
+		}
+	}
+
+	if dealIdx == -1 {
+		return dealID, xerrors.Errorf("could not find deal in publish deals message %s", publishCid)
+	}
+
+	if dealIdx >= len(retval.IDs) {
+		return dealID, xerrors.Errorf("deal index %d out of bounds of deals (len %d) in publish deals message %s",
+			dealIdx, len(retval.IDs), publishCid)
+	}
+
+	return retval.IDs[dealIdx], nil
 }
 
 func checkDealEquality(ctx context.Context, ts *types.TipSet, api getCurrentDealInfoAPI, p1, p2 market.DealProposal) (bool, error) {

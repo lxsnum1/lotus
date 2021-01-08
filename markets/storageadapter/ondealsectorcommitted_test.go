@@ -22,6 +22,7 @@ import (
 	"github.com/filecoin-project/lotus/chain/events"
 	test "github.com/filecoin-project/lotus/chain/events/state/mock"
 	"github.com/filecoin-project/lotus/chain/types"
+	tutils "github.com/filecoin-project/specs-actors/v2/support/testing"
 	"github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/require"
 )
@@ -34,12 +35,16 @@ func TestOnDealSectorPreCommitted(t *testing.T) {
 	pieceCid := generateCids(1)[0]
 	startDealID := abi.DealID(rand.Uint64())
 	newDealID := abi.DealID(rand.Uint64())
-	newValueReturn := makePublishDealsReturnBytes(t, []abi.DealID{newDealID})
 	sectorNumber := abi.SectorNumber(rand.Uint64())
 	proposal := market.DealProposal{
-		PieceCID:  pieceCid,
-		PieceSize: abi.PaddedPieceSize(rand.Uint64()),
-		Label:     "success",
+		PieceCID:             pieceCid,
+		PieceSize:            abi.PaddedPieceSize(rand.Uint64()),
+		Client:               tutils.NewActorAddr(t, "client"),
+		Provider:             tutils.NewActorAddr(t, "provider"),
+		StoragePricePerEpoch: abi.NewTokenAmount(1),
+		ProviderCollateral:   abi.NewTokenAmount(1),
+		ClientCollateral:     abi.NewTokenAmount(1),
+		Label:                "success",
 	}
 	unfinishedDeal := &api.MarketDeal{
 		Proposal: proposal,
@@ -69,6 +74,12 @@ func TestOnDealSectorPreCommitted(t *testing.T) {
 	}
 	testCases := map[string]testCase{
 		"normal sequence": {
+			searchMessageLookup: &api.MsgLookup{
+				Receipt: types.MessageReceipt{
+					ExitCode: exitcode.Ok,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{startDealID}),
+				},
+			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
 				startDealID: unfinishedDeal,
 			},
@@ -92,7 +103,7 @@ func TestOnDealSectorPreCommitted(t *testing.T) {
 			searchMessageLookup: &api.MsgLookup{
 				Receipt: types.MessageReceipt{
 					ExitCode: exitcode.Ok,
-					Return:   newValueReturn,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{newDealID}),
 				},
 			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
@@ -115,6 +126,12 @@ func TestOnDealSectorPreCommitted(t *testing.T) {
 			expectedCBSectorNumber: sectorNumber,
 		},
 		"ignores unsuccessful pre-commit message": {
+			searchMessageLookup: &api.MsgLookup{
+				Receipt: types.MessageReceipt{
+					ExitCode: exitcode.Ok,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{startDealID}),
+				},
+			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
 				startDealID: unfinishedDeal,
 			},
@@ -137,9 +154,15 @@ func TestOnDealSectorPreCommitted(t *testing.T) {
 			checkTsDeals:        map[abi.DealID]*api.MarketDeal{},
 			searchMessageErr:    errors.New("something went wrong"),
 			expectedCBCallCount: 0,
-			expectedError:       errors.New("failed to set up called handler: failed to look up deal on chain: something went wrong"),
+			expectedError:       xerrors.Errorf("failed to set up called handler: check if deal active: failed to look up deal on chain: looking for publish deal message %s: search msg failed: something went wrong", publishCid),
 		},
 		"sector start epoch > 0 in check": {
+			searchMessageLookup: &api.MsgLookup{
+				Receipt: types.MessageReceipt{
+					ExitCode: exitcode.Ok,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{startDealID}),
+				},
+			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
 				startDealID: successDeal,
 			},
@@ -161,9 +184,8 @@ func TestOnDealSectorPreCommitted(t *testing.T) {
 					deals: map[abi.DealID]*api.MarketDeal{},
 				},
 			},
-			expectedCBCallCount: 1,
-			expectedCBError:     errors.New("handling applied event: something went wrong"),
-			expectedError:       errors.New("failed to set up called handler: something went wrong"),
+			expectedCBCallCount: 0,
+			expectedError:       xerrors.Errorf("failed to set up called handler: check if deal active: failed to look up deal on chain: looking for publish deal message %s: search msg failed: something went wrong", publishCid),
 		},
 		"proposed deal epoch timeout": {
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
@@ -171,7 +193,7 @@ func TestOnDealSectorPreCommitted(t *testing.T) {
 			},
 			dealStartEpochTimeout: true,
 			expectedCBCallCount:   1,
-			expectedCBError:       xerrors.Errorf("handling applied event: deal %d was not activated by proposed deal start epoch 0", startDealID),
+			expectedCBError:       xerrors.Errorf("handling applied event: deal with piece CID %s was not activated by proposed deal start epoch 0", unfinishedDeal.Proposal.PieceCID),
 		},
 	}
 	runTestCase := func(testCase string, data testCase) {
@@ -218,7 +240,7 @@ func TestOnDealSectorPreCommitted(t *testing.T) {
 				cbIsActive = isActive
 				cbError = err
 			}
-			err = OnDealSectorPreCommitted(ctx, api, eventsAPI, provider, startDealID, proposal, &publishCid, cb)
+			err = OnDealSectorPreCommitted(ctx, api, eventsAPI, provider, proposal, &publishCid, cb)
 			if data.expectedError == nil {
 				require.NoError(t, err)
 			} else {
@@ -249,9 +271,14 @@ func TestOnDealSectorCommitted(t *testing.T) {
 	newValueReturn := makePublishDealsReturnBytes(t, []abi.DealID{newDealID})
 	sectorNumber := abi.SectorNumber(rand.Uint64())
 	proposal := market.DealProposal{
-		PieceCID:  pieceCid,
-		PieceSize: abi.PaddedPieceSize(rand.Uint64()),
-		Label:     "success",
+		PieceCID:             pieceCid,
+		PieceSize:            abi.PaddedPieceSize(rand.Uint64()),
+		Client:               tutils.NewActorAddr(t, "client"),
+		Provider:             tutils.NewActorAddr(t, "provider"),
+		StoragePricePerEpoch: abi.NewTokenAmount(1),
+		ProviderCollateral:   abi.NewTokenAmount(1),
+		ClientCollateral:     abi.NewTokenAmount(1),
+		Label:                "success",
 	}
 	unfinishedDeal := &api.MarketDeal{
 		Proposal: proposal,
@@ -279,6 +306,12 @@ func TestOnDealSectorCommitted(t *testing.T) {
 	}
 	testCases := map[string]testCase{
 		"normal sequence": {
+			searchMessageLookup: &api.MsgLookup{
+				Receipt: types.MessageReceipt{
+					ExitCode: exitcode.Ok,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{startDealID}),
+				},
+			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
 				startDealID: unfinishedDeal,
 			},
@@ -317,6 +350,12 @@ func TestOnDealSectorCommitted(t *testing.T) {
 			expectedCBCallCount: 1,
 		},
 		"ignores unsuccessful prove-commit message": {
+			searchMessageLookup: &api.MsgLookup{
+				Receipt: types.MessageReceipt{
+					ExitCode: exitcode.Ok,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{startDealID}),
+				},
+			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
 				startDealID: unfinishedDeal,
 			},
@@ -337,9 +376,15 @@ func TestOnDealSectorCommitted(t *testing.T) {
 			checkTsDeals:        map[abi.DealID]*api.MarketDeal{},
 			searchMessageErr:    errors.New("something went wrong"),
 			expectedCBCallCount: 0,
-			expectedError:       errors.New("failed to set up called handler: failed to look up deal on chain: something went wrong"),
+			expectedError:       xerrors.Errorf("failed to set up called handler: check if deal active: failed to look up deal on chain: looking for publish deal message %s: search msg failed: something went wrong", publishCid),
 		},
 		"sector start epoch > 0 in check": {
+			searchMessageLookup: &api.MsgLookup{
+				Receipt: types.MessageReceipt{
+					ExitCode: exitcode.Ok,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{startDealID}),
+				},
+			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
 				startDealID: successDeal,
 			},
@@ -347,6 +392,12 @@ func TestOnDealSectorCommitted(t *testing.T) {
 		},
 		"error on deal in called": {
 			searchMessageErr: errors.New("something went wrong"),
+			searchMessageLookup: &api.MsgLookup{
+				Receipt: types.MessageReceipt{
+					ExitCode: exitcode.Ok,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{startDealID}),
+				},
+			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
 				startDealID: unfinishedDeal,
 			},
@@ -360,17 +411,21 @@ func TestOnDealSectorCommitted(t *testing.T) {
 					},
 				},
 			},
-			expectedCBCallCount: 1,
-			expectedCBError:     errors.New("handling applied event: failed to look up deal on chain: something went wrong"),
-			expectedError:       errors.New("failed to set up called handler: failed to look up deal on chain: something went wrong"),
+			expectedError: xerrors.Errorf("failed to set up called handler: check if deal active: failed to look up deal on chain: looking for publish deal message %s: search msg failed: something went wrong", publishCid),
 		},
 		"proposed deal epoch timeout": {
+			searchMessageLookup: &api.MsgLookup{
+				Receipt: types.MessageReceipt{
+					ExitCode: exitcode.Ok,
+					Return:   makePublishDealsReturnBytes(t, []abi.DealID{startDealID}),
+				},
+			},
 			checkTsDeals: map[abi.DealID]*api.MarketDeal{
 				startDealID: unfinishedDeal,
 			},
 			dealStartEpochTimeout: true,
 			expectedCBCallCount:   1,
-			expectedCBError:       xerrors.Errorf("handling applied event: deal %d was not activated by proposed deal start epoch 0", startDealID),
+			expectedCBError:       xerrors.Errorf("handling applied event: deal with piece CID %s was not activated by proposed deal start epoch 0", unfinishedDeal.Proposal.PieceCID),
 		},
 	}
 	runTestCase := func(testCase string, data testCase) {
@@ -413,7 +468,7 @@ func TestOnDealSectorCommitted(t *testing.T) {
 				cbCallCount++
 				cbError = err
 			}
-			err = OnDealSectorCommitted(ctx, api, eventsAPI, provider, startDealID, sectorNumber, proposal, &publishCid, cb)
+			err = OnDealSectorCommitted(ctx, api, eventsAPI, provider, sectorNumber, proposal, &publishCid, cb)
 			if data.expectedError == nil {
 				require.NoError(t, err)
 			} else {

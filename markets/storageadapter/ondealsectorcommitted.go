@@ -21,7 +21,7 @@ type sectorCommittedEventsAPI interface {
 	Called(check events.CheckFunc, msgHnd events.MsgHandler, rev events.RevertHandler, confidence int, timeout abi.ChainEpoch, mf events.MsgMatchFunc) error
 }
 
-func OnDealSectorPreCommitted(ctx context.Context, api getCurrentDealInfoAPI, eventsApi sectorCommittedEventsAPI, provider address.Address, dealID abi.DealID, proposal market.DealProposal, publishCid *cid.Cid, callback storagemarket.DealSectorPreCommittedCallback) error {
+func OnDealSectorPreCommitted(ctx context.Context, api getCurrentDealInfoAPI, eventsApi sectorCommittedEventsAPI, provider address.Address, proposal market.DealProposal, publishCid *cid.Cid, callback storagemarket.DealSectorPreCommittedCallback) error {
 	// Ensure callback is only called once
 	var once sync.Once
 	cb := func(sectorNumber abi.SectorNumber, isActive bool, err error) {
@@ -32,7 +32,7 @@ func OnDealSectorPreCommitted(ctx context.Context, api getCurrentDealInfoAPI, ev
 
 	// First check if the deal is already active, and if so, bail out
 	checkFunc := func(ts *types.TipSet) (done bool, more bool, err error) {
-		isActive, err := checkIfDealAlreadyActive(ctx, api, ts, dealID, proposal, publishCid)
+		isActive, err := checkIfDealAlreadyActive(ctx, api, ts, proposal, publishCid)
 		if err != nil {
 			// Note: the error returned from here will end up being returned
 			// from OnDealSectorPreCommitted so no need to call the callback
@@ -71,7 +71,7 @@ func OnDealSectorPreCommitted(ctx context.Context, api getCurrentDealInfoAPI, ev
 		// If the deal hasn't been activated by the proposed start epoch, the
 		// deal will timeout (when msg == nil it means the timeout epoch was reached)
 		if msg == nil {
-			err = xerrors.Errorf("deal %d was not activated by proposed deal start epoch %d", dealID, proposal.StartEpoch)
+			err = xerrors.Errorf("deal with piece CID %s was not activated by proposed deal start epoch %d", proposal.PieceCID, proposal.StartEpoch)
 			return false, err
 		}
 
@@ -86,9 +86,9 @@ func OnDealSectorPreCommitted(ctx context.Context, api getCurrentDealInfoAPI, ev
 			return false, xerrors.Errorf("unmarshal pre commit: %w", err)
 		}
 
-		// When the deal is published, the deal ID may change, so get the
+		// When there is a reorg, the deal ID may change, so get the
 		// current deal ID from the publish message CID
-		dealID, _, err = GetCurrentDealInfo(ctx, ts, api, dealID, proposal, publishCid)
+		dealID, _, err := GetCurrentDealInfo(ctx, ts, api, proposal, publishCid)
 		if err != nil {
 			return false, err
 		}
@@ -119,7 +119,7 @@ func OnDealSectorPreCommitted(ctx context.Context, api getCurrentDealInfoAPI, ev
 	return nil
 }
 
-func OnDealSectorCommitted(ctx context.Context, api getCurrentDealInfoAPI, eventsApi sectorCommittedEventsAPI, provider address.Address, dealID abi.DealID, sectorNumber abi.SectorNumber, proposal market.DealProposal, publishCid *cid.Cid, callback storagemarket.DealSectorCommittedCallback) error {
+func OnDealSectorCommitted(ctx context.Context, api getCurrentDealInfoAPI, eventsApi sectorCommittedEventsAPI, provider address.Address, sectorNumber abi.SectorNumber, proposal market.DealProposal, publishCid *cid.Cid, callback storagemarket.DealSectorCommittedCallback) error {
 	// Ensure callback is only called once
 	var once sync.Once
 	cb := func(err error) {
@@ -130,7 +130,7 @@ func OnDealSectorCommitted(ctx context.Context, api getCurrentDealInfoAPI, event
 
 	// First check if the deal is already active, and if so, bail out
 	checkFunc := func(ts *types.TipSet) (done bool, more bool, err error) {
-		isActive, err := checkIfDealAlreadyActive(ctx, api, ts, dealID, proposal, publishCid)
+		isActive, err := checkIfDealAlreadyActive(ctx, api, ts, proposal, publishCid)
 		if err != nil {
 			// Note: the error returned from here will end up being returned
 			// from OnDealSectorCommitted so no need to call the callback
@@ -176,7 +176,7 @@ func OnDealSectorCommitted(ctx context.Context, api getCurrentDealInfoAPI, event
 		// If the deal hasn't been activated by the proposed start epoch, the
 		// deal will timeout (when msg == nil it means the timeout epoch was reached)
 		if msg == nil {
-			err := xerrors.Errorf("deal %d was not activated by proposed deal start epoch %d", dealID, proposal.StartEpoch)
+			err := xerrors.Errorf("deal with piece CID %s was not activated by proposed deal start epoch %d", proposal.PieceCID, proposal.StartEpoch)
 			return false, err
 		}
 
@@ -186,7 +186,7 @@ func OnDealSectorCommitted(ctx context.Context, api getCurrentDealInfoAPI, event
 		}
 
 		// Get the deal info
-		_, sd, err := GetCurrentDealInfo(ctx, ts, api, dealID, proposal, publishCid)
+		dealID, sd, err := GetCurrentDealInfo(ctx, ts, api, proposal, publishCid)
 		if err != nil {
 			return false, xerrors.Errorf("failed to look up deal on chain: %w", err)
 		}
@@ -216,11 +216,10 @@ func OnDealSectorCommitted(ctx context.Context, api getCurrentDealInfoAPI, event
 	return nil
 }
 
-func checkIfDealAlreadyActive(ctx context.Context, api getCurrentDealInfoAPI, ts *types.TipSet, dealID abi.DealID, proposal market.DealProposal, publishCid *cid.Cid) (bool, error) {
-	_, sd, err := GetCurrentDealInfo(ctx, ts, api, dealID, proposal, publishCid)
+func checkIfDealAlreadyActive(ctx context.Context, api getCurrentDealInfoAPI, ts *types.TipSet, proposal market.DealProposal, publishCid *cid.Cid) (bool, error) {
+	dealID, sd, err := GetCurrentDealInfo(ctx, ts, api, proposal, publishCid)
 	if err != nil {
-		// TODO: This may be fine for some errors
-		return false, xerrors.Errorf("failed to look up deal on chain: %w", err)
+		return false, xerrors.Errorf("check if deal active: failed to look up deal on chain: %w", err)
 	}
 
 	// Sector with deal is already active
